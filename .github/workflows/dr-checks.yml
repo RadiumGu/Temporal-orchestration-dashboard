@@ -1,0 +1,22 @@
+name: dr-checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 -m pip install -r requirements-dev.txt
+      - name: tests
+        env:
+          # 没有 temporalio 时 importorskip 会把 test_129 变成 skip，而 skip 是绿的。
+          DR_REQUIRE_TEMPORAL: "1"
+          # 通过数下限。拆分后实测 248 passed（2026-11-06）；新增测试后请上调。
+          DR_MIN_PASSED: "245"
+        run: python3 -m pytest tests/ -q

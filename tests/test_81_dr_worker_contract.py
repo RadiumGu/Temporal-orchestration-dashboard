@@ -55,29 +55,8 @@ class TestConcurrencyIsNotOne:
         assert "workflow ID" in src
 
 
-class TestMutualExclusionViaWorkflowId:
-    """互斥靠 workflow ID —— 发起侧不许拆掉它。"""
-
-    def test_start_args_do_not_pass_allow_duplicate(self):
-        from executor_temporal import TemporalExecutor
-
-        args = TemporalExecutor(dry_run=True)._build_start_args(
-            plan=None,  # type: ignore[arg-type]
-            plan_ref="p1",
-        )
-        # 传 ALLOW_DUPLICATE 会让同一个 ID 可以并发启动，互斥就没了。
-        assert "id_reuse_policy" not in args or "ALLOW_DUPLICATE" not in str(
-            args.get("id_reuse_policy", "")
-        ), "传 ALLOW_DUPLICATE 会拆掉「同一份计划不许重复触发」这层互斥"
-
-    def test_workflow_id_derives_from_plan_ref(self):
-        from executor_temporal import TemporalExecutor
-
-        ex = TemporalExecutor(dry_run=True)
-        a = ex._build_start_args(plan=None, plan_ref="alpha")  # type: ignore[arg-type]
-        b = ex._build_start_args(plan=None, plan_ref="beta")  # type: ignore[arg-type]
-        assert a["workflow_id"] != b["workflow_id"]
-        assert "alpha" in a["workflow_id"]
+# TestMutualExclusionViaWorkflowId 守的是 dr-plan-generator/executor_temporal.py（旧执行器骨架），
+# 那个文件和 executor_base / models 绑在一起，留在 graph-dependency-platform，用例也留在那边。
 
 
 class TestWorkerUsesGrpcPort:

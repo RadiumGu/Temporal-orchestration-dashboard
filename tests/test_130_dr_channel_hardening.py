@@ -18,7 +18,8 @@ RT = ROOT / "infra" / "dr-korea" / "06-agentcore-runtime.yaml"
 RW = ROOT / "dr-plan-generator" / "worker" / "runbook_workflow.py"
 PROV = ROOT / "dr-plan-generator" / "worker" / "provision-worker.sh"
 DEPLOY = ROOT / "infra" / "dr-korea" / "temporal-1.32" / "deploy-worker.sh"
-CI = ROOT / ".github" / "workflows" / "migration-checks.yml"
+#: 拆出 graph-dependency-platform 之后本仓库自己的 CI（原为 migration-checks.yml）
+CI = ROOT / ".github" / "workflows" / "dr-checks.yml"
 REQ = ROOT / "requirements-dev.txt"
 T129 = ROOT / "tests" / "test_129_dr_runbook_workflow.py"
 RECORD = ROOT / "docs" / "runbooks" / "deployment-record.md"
@@ -94,8 +95,9 @@ class TestCiCannotSilentlySkipTheBehaviourTest:
 
     def test_floor_is_not_left_far_behind(self):
         import re
-        m = re.search(r'GDP_OFFLINE_MIN_PASSED: "(\d+)"', CI.read_text(encoding="utf-8"))
-        assert m and int(m.group(1)) >= 1800, "下限落后实际通过数太多就挡不住大面积 skip"
+        m = re.search(r'DR_MIN_PASSED: "(\d+)"', CI.read_text(encoding="utf-8"))
+        # 拆分后本仓库实测 248 passed（2026-11-06）。新增测试后请上调。
+        assert m and int(m.group(1)) >= 245, "下限落后实际通过数太多就挡不住大面积 skip"
 
     def test_parent_workflow_lives_in_a_sandbox_safe_module(self):
         assert (ROOT / "tests" / "_dr_live_parent.py").exists()

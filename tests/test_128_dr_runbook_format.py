@@ -332,13 +332,10 @@ class TestTemporalNeverMutates:
 
 class TestRetentionCommentIsCurrent:
     def test_no_stale_one_day_claim(self):
-        for p in [*W.glob("*.py"), ROOT / "dr-plan-generator" / "executor_temporal.py"]:
+        # executor_temporal.py 留在 graph-dependency-platform，那边的同名用例继续守它。
+        for p in W.glob("*.py"):
             t = p.read_text(encoding="utf-8")
             assert "保留期只有 1 天" not in t and "保留期只有 86400" not in t, p.name
-
-    def test_measured_value_recorded(self):
-        t = (ROOT / "dr-plan-generator" / "executor_temporal.py").read_text(encoding="utf-8")
-        assert "2592000s" in t and "720h" in t
 
 
 def test_deep_copy_does_not_alias(tmp_path):
