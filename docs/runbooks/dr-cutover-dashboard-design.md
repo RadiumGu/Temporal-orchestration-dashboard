@@ -191,7 +191,7 @@ interface StepView {
 | 档 | 大屏能做什么 | 审计链 | 建议 |
 |---|---|---|---|
 | **v1 只读 + 复制命令** | 等待卡片给出完整的 `probe_cli.py update <wid> confirm_step '{...}'`，人粘贴到 SSM 会话执行 | 不变 | **先做这个** |
-| v2 只读大屏对外 | 会议室 / 客户经首尔 CloudFront + Cognito 只读访问 | 不涉及写 | 跟 §5 前门方案一起做 |
+| v2 只读大屏对外 | 会议室 / 客户经 `temporal.rainmeadows.com/dashboard/wall/...` 只读访问（同一 Cognito 登录） | 不涉及写 | 入口在 v1 就已具备，见 §8 |
 | v3 控制台写操作 | 按钮直接发 Update，BFF 从已验签的登录令牌取身份，强制写 `meta.identity = console:<email>`，带 `update_id` 幂等键，并把请求本身另记一份到 S3 | 新增一条**已认证**通道 | **需要你决定**；不可逆步骤建议同时要求第二人确认 |
 
 v3 的硬约束：BFF 不做任何校验逻辑，validator 拒绝什么就原样显示什么；BFF 的 IAM 权限与 worker 一样只读 AWS，它写的只有 Temporal Update 和 S3 审计记录。
@@ -207,15 +207,66 @@ v3 的硬约束：BFF 不做任何校验逻辑，validator 拒绝什么就原样
 
 G1 不做也能出 v1：BFF 走 §5.2 的降级路径从 history 推导时间。但那样每次快照都要读全量 history，长执行会慢，所以 G1 排在 BFF 之前。
 
-## 8. 部署（首尔）
+## 8. 部署：挂在现有 Temporal 域名下的 `/dashboard/`
 
-| 项 | 做法 |
+> 2026-11-07 修订。负责人要求**不新增独立域名**，因此取代本节初稿里的「首尔 CloudFront 新入口」。
+> 现有入口的来历见 `docs/runbooks/deployment-record.md` §4.35。
+
+### 8.1 访问地址
+
+| 视图 | URL |
 |---|---|
-| 运行 | Temporal EC2 上 `docker run`，与 server、worker 同一 compose 网络；监听 `127.0.0.1:8090`，不开安全组 |
-| 访问（v1） | `aws ssm start-session --target <首尔 Temporal 实例> --document-name AWS-StartPortForwardingSession --parameters portNumber=8090,localPortNumber=8090`，浏览器开 `http://127.0.0.1:8090` |
-| 权限 | 复用 worker 实例角色的只读权限 + 对执行记录桶的 `s3:GetObject`/`ListBucket`；v3 才需要 `s3:PutObject` 到单独的审计前缀 |
-| 入口（v2） | 首尔 CloudFront + Cognito（上位设计 §5/§7 已规划），源站经 CloudFront VPC origin 到内网 ALB 或实例。Cognito 在首尔建 user pool；若用 IAM Identity Center，要确认已复制到首尔（Identity Center 2026 起支持多区域复制，但需要客户托管的多区域 KMS 密钥），否则东京故障时登录不了 |
-| 前端 | React + Vite + TypeScript，`EventSource` 收 SSE；构建产物由 BFF 直接托管，不另起 S3 站点 |
+| 总览 | `https://temporal.rainmeadows.com/dashboard/` |
+| 单次执行 | `https://temporal.rainmeadows.com/dashboard/runs/<workflowId>` |
+| 会议室大屏 | `https://temporal.rainmeadows.com/dashboard/wall/<workflowId>` |
+| Temporal UI（不变） | `https://temporal.rainmeadows.com/` |
+
+### 8.2 链路
+
+```
+temporal.rainmeadows.com（Cloudflare 灰云 CNAME，已存在）
+  → 东京公网 ALB Servic-PetSi-by0kpyBtxswj  443 监听器（已存在，*.rainmeadows.com 证书）
+      优先级 4   host=temporal.rainmeadows.com AND path=/dashboard 或 /dashboard/*      ← 新增
+                 动作 1 authenticate-cognito（与 Temporal UI 规则同一池、同一 client、同一 session cookie 名）
+                 动作 2 forward → dr-cutover-dashboard-tg（新增，ip 目标，AvailabilityZone=all）
+      优先级 5   host=temporal.rainmeadows.com → dr-temporal-ui-tg                     ← 现有规则，从 4 挪到 5
+  → 跨区 VPC 对等 pcx-09fc849e6ac38e7e1（已存在）
+  → 10.20.1.10:8090  dashboard-bff 容器（新增，与 Temporal server / UI / worker 同机）
+```
+
+只新增三样东西：一个目标组、一条监听器规则、两条安全组入站规则。域名、DNS、证书、ALB、Cognito 池和回调、VPC 对等都复用。
+
+### 8.3 关键细节
+
+| 项 | 做法 | 原因 |
+|---|---|---|
+| 规则位置 | 新规则用优先级 4，现有 Temporal UI 规则改为 5 | ALB 取第一个匹配的规则，而现有规则只按主机名匹配，会把 `/dashboard/*` 交给 Temporal UI 的 SPA（任何路径都返回 200 的 index.html，§4.35 ③ 踩过）。新规则也必须排在 1–3 的 `X-Demo-Bypass` 旁路规则**之后**：带旁路头的请求先被规则 3 转给 petsite，到不了大屏 |
+| 不停机切换 | 先以优先级 6 建新规则（此时被规则 4 挡住、不生效），再用**一次** `set-rule-priorities` 把 Temporal UI 规则 4→5、新规则 6→4 | 单次调用一起改，不会出现某条规则缺失的时间窗口 |
+| 路径条件 | 写 `/dashboard` 和 `/dashboard/*` 两个值，不写 `/dashboard*` | `/dashboard*` 还会匹配 `/dashboardx` 之类的路径 |
+| 前缀不改写 | ALB forward 不改写 URL，所以 BFF 和前端都在 `/dashboard` 下服务：Vite `base: '/dashboard/'`，接口 `/dashboard/api/...`，SSE `/dashboard/api/runs/{id}/stream`，健康检查 `/dashboard/healthz` | Temporal UI 走不了路径前缀，就是因为它没有 base path 配置（§4.35 ③）。大屏是自建的，从一开始就带前缀 |
+| Cognito | **不改 Cognito client**。同一主机名，回调 `https://temporal.rainmeadows.com/oauth2/idpresponse` 已经登记过 | `update-user-pool-client` 是整体替换，§4.35 ④ 差点因此弄坏全部入口。不碰它就没有这个风险 |
+| 共享登录 | 新规则的 `SessionCookieName`、user pool、client 照抄现有 Temporal UI 规则（先 `describe-rules` 读出来） | 登录一次，Temporal UI 和大屏都能用 |
+| 容器监听 | compose 里写 `ports: ["10.20.1.10:8090:8090"]`，只绑私网地址 | 不绑 0.0.0.0，也不经 docker 默认网桥对外 |
+| 安全组 | 8090 只放行东京 ALB 的两个子网 `11.0.0.0/24`、`11.0.1.0/24`，与 8080 现行规则相同 | 认证全部在 ALB 上做。8090 如果对整个首尔 VPC 开放，就是一个绕过 Cognito 的侧门（§4.35 ⑤ 关过 8080 的同类侧门） |
+| SSE 过 ALB | 每 15 秒发一次心跳注释行（`: ping`）；响应头 `Cache-Control: no-cache`、`X-Accel-Buffering: no` | ALB 默认空闲超时 60 秒，没有心跳的话，等人那几分钟连接会被 ALB 断开 |
+| 登录过期 | 接口返回 302 时（ALB 把未登录请求重定向到 Cognito），前端显示「登录已过期，请刷新」，不静默重连 | `EventSource` 和 `fetch` 不会跟随跨域跳到 Cognito 的重定向，静默重连会让页面一直停在旧状态 |
+| 查看者身份 | BFF 读 ALB 注入的 `x-amzn-oidc-data`（ALB 签名的 JWT），校验签名和 `signer` 字段等于本 ALB 的 ARN 后，才在页面角落显示「当前查看者」 | v1 只用于显示。v3 写操作的「已认证身份」就从这里来，不需要另建登录 |
+| 运行 | 在 `infra/dr-korea/temporal-1.32/docker-compose.yml` 里加 `dr-dashboard` 服务，镜像基于 `python:3.11-slim`，代码与前端构建产物照 `deploy-worker.sh` 的方式从 git 对象库发布到 S3，主机经 SSM 拉取 | 与 worker 同一条发布路径，不另开一条 |
+| 权限 | 复用 worker 实例角色的只读权限，加执行记录桶的 `s3:GetObject`/`ListBucket`；v3 才需要 `s3:PutObject` 到单独的审计前缀 | 大屏不做任何 AWS 写操作 |
+| 前端 | React + Vite + TypeScript，`EventSource` 收 SSE；构建产物由 BFF 托管，不另起 S3 站点 | — |
+
+### 8.4 这个入口的代价：东京故障时它跟着不可用
+
+域名、ALB、Cognito 池都在东京侧（Cognito 池所在区域待核实，见 §13），所以东京区域故障时，`temporal.rainmeadows.com/dashboard/` 和 Temporal UI 一起不可用。而真实切换恰好发生在东京出问题的时候。
+
+- **演练**（主要使用场景）：东京是好的，走这个入口没有问题。
+- **真实的东京故障**：BFF 本身在首尔、不依赖东京，所以退回 SSM 端口转发：`aws ssm start-session --region ap-northeast-2 --target <首尔 Temporal 实例> --document-name AWS-StartPortForwardingSession --parameters portNumber=8090,localPortNumber=8090`，浏览器打开 `http://127.0.0.1:8090/dashboard/`。路径前缀一样，页面一样，只是没有 Cognito 登录这一层，身份由 SSM 会话的 IAM 身份承担。这条命令要写进切换 runbook 的第 0 步。
+- **以后如果要「东京挂了也能用同一个域名」**：在首尔准备一个备用入口（首尔 ALB 或 CloudFront，加首尔 ACM 证书和首尔 Cognito），故障时在 Cloudflare 上把 `temporal` 这条 CNAME 指过去。域名不变，但要多一套常备资源，且依赖有人能登录 Cloudflare。现在不做。
+
+### 8.5 已知的脆弱点（与现有入口相同）
+
+- 这些规则全是 CLI 建的。`cdk deploy ServicesEks2` 会抹掉同一监听器上手工加的规则（§4.35 ⑧），新规则也会一起丢。重建命令要和 Temporal UI 规则的放在一起维护（原仓库 `test_111` 的文档字符串）。
+- `02-temporal.yaml` 里 8080 仍写着放行整个首尔 VPC，而线上已用 CLI 收紧到东京 ALB 子网，两边不一致。8090 的规则写进 CFN 时要按收紧后的版本写，同时把 8080 也改正，否则下次 stack 更新会把侧门重新打开。
 
 ## 9. 故障模式
 
@@ -225,7 +276,8 @@ G1 不做也能出 v1：BFF 走 §5.2 的降级路径从 history 推导时间。
 | workflow task 激活失败 | 列表仍 Running | 读 `TemporalReportedProblems`，显示问题类别 |
 | BFF 自己挂了 | 浏览器 SSE 断开 | 前端显示「连接断开 N 秒」，不保留最后一帧当作当前状态 |
 | Temporal EC2 不可用 | 全部不可用 | 与编排器同命运（已接受的单点）；切换按纸面 runbook + S3 最近执行记录继续 |
-| 东京区域故障 | 不受影响 | 全部组件在首尔；入口不再经东京 ALB |
+| 东京区域故障 | `temporal.rainmeadows.com/dashboard/` 打不开（入口在东京 ALB） | BFF 与数据都在首尔，照 §8.4 改走 SSM 端口转发，同一路径 `/dashboard/` |
+| `cdk deploy ServicesEks2` | 规则被抹掉，`/dashboard/` 落到默认规则返回 petsite | 按 §8.5 用记录的命令重建；部署后复核监听器规则 |
 | visibility 滞后 | 列表与详情短暂不一致 | 以详情（describe / query）为准 |
 
 ## 10. 验证计划
@@ -241,10 +293,10 @@ G1 不做也能出 v1：BFF 走 §5.2 的降级路径从 history 推导时间。
 | 阶段 | 内容 | 前置 |
 |---|---|---|
 | 1 | G1 + G4（时间戳与全量进度 query） | 回放验证 |
-| 2 | BFF + 执行视图 + 总览视图，SSM 端口转发访问，只读 + 复制命令（v1） | 1 |
+| 2 | BFF + 执行视图 + 总览视图，挂到 `temporal.rainmeadows.com/dashboard/`（§8），只读 + 复制命令（v1） | 1 |
 | 3 | G2 计划时长与 RTO；预测完成时间上线 | 一次真实演练取基线 |
 | 4 | G3 通道身份前缀 | 无 |
-| 5 | 大屏视图 + 首尔 CloudFront/Cognito 只读入口（v2） | 上位设计 §5 前门 |
+| 5 | 大屏视图 `/dashboard/wall/`（v2）；是否建首尔备用入口另议（§8.4） | 2 |
 | 6 | 控制台写操作（v3） | **你的决定** |
 
 ## 12. 待你决定
@@ -255,7 +307,10 @@ G1 不做也能出 v1：BFF 走 §5.2 的降级路径从 history 推导时间。
 
 ## 13. 未核实
 
-- CloudFront VPC origin 与内网 ALB + Cognito 认证动作组合是否可行（ALB 认证动作需要能访问 IdP 端点），v2 动手前要实测；备选是在 CloudFront 侧用 Lambda@Edge 验证令牌。
+- 现有 Temporal UI 规则（优先级 4）的认证动作参数（user pool、client、`SessionCookieName`、`OnUnauthenticatedRequest`）没有重新读取，新规则照抄前要先 `describe-rules`。
+- Cognito 池 `openclaw-users` 所在区域没有核实（重定向域名前缀是 `openclaw-auth-1739343674`）。如果在东京，东京故障时登录也会失效，§8.4 的结论不变。
+- 首尔 Temporal 主机能否访问 `public-keys.auth.elb.ap-northeast-1.amazonaws.com`（校验 ALB JWT 用）没有核实。v1 只用于显示查看者，取不到就不显示；v3 之前必须解决。
+- ALB 监听器当前的空闲超时没有核实，心跳间隔按默认 60 秒取 15 秒。
 - 首尔 Temporal UI 的版本（Timeline 渲染 activity summary 需要 ≥ v2.34.6）与本设计无关，未查。
 - 本机到首尔 Temporal（`10.20.1.10:7243`）不通，本文没有读取在途执行的实时数据；状态推导表是按 `origin/main` 源码写的，G1 落地时要用真实 history 对一遍。
 - 本机 AWS 凭证当前无效（`InvalidClientTokenId`），没有核对首尔的 IAM、安全组和 Identity Center 配置。
